@@ -1,0 +1,368 @@
+---
+title: "dea ahp"
+output: html_document
+date: "2025-06-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+
+```{r}
+library(readxl)
+library(lpSolveAPI)
+library(dplyr)
+```
+
+
+```{r}
+# Load Excel file (update filename if needed)
+data <- read_excel("2019.xlsx", skip = 1)
+
+head(data)
+
+# Define input/output columns by name or index (update as needed)
+inputs <- as.matrix(data[, c("PE", "DE")])    # Inputs
+outputs <- as.matrix(data[, c("ROE", "FCF", "RG")]) # Outputs
+
+# Optional: scale
+inputs <- inputs * 10
+outputs <- outputs * 10
+head(inputs)
+head(outputs)
+```
+
+
+```{r}
+n <- nrow(inputs)
+m <- ncol(inputs)
+s <- ncol(outputs)
+
+# Storage
+eff_scores <- numeric(n)
+v_weights <- matrix(0, n, m)
+u_weights <- matrix(0, n, s)
+mu_vals <- numeric(n)
+```
+
+
+```{r}
+for (dmu_index in 1:n) {
+  x0 <- inputs[dmu_index, ]
+  y0 <- outputs[dmu_index, ]
+  total_vars <- m + s + 1  # v_i + u_r + mu
+
+  lpmodel <- make.lp(0, total_vars)
+  lp.control(lpmodel, sense = "max")  # ✅ output-oriented
+
+  # Objective: maximize weighted outputs
+  set.objfn(lpmodel, c(rep(0, m), y0, 0))
+
+   # Constraints for all DMUs: u*y_j - v*x_j + mu <= 0
+  for (j in 1:n) {
+    row <- c(-inputs[j, ], outputs[j, ], 1)  # +mu
+    add.constraint(lpmodel, xt = row, type = "<=", rhs = 0)
+  }
+
+  
+  # Set bounds
+  for (i in 1:(m + s)) {
+    set.bounds(lpmodel, lower = 0.0001, columns = i)
+  }
+
+  
+# === CUSTOM BOUNDS ===
+# Inputs
+set.bounds(lpmodel, lower = 0.05625244, upper = 0.29251269, columns = 1)  # v1
+set.bounds(lpmodel, lower = 0.071225702, upper = 0.370373652, columns = 2)  # u4
+
+# Outputs
+set.bounds(lpmodel, lower = 0.106622528, upper = 0.554437145, columns = 3)  # u1
+set.bounds(lpmodel, lower = 0.173562516, upper = 0.902525083, columns = 4) # u2
+set.bounds(lpmodel, lower = 0.092336814, upper = 0.48015143, columns = 5) # u3
+
+
+
+    # mu is unrestricted
+  set.type(lpmodel, columns = total_vars, type = "real")
+
+   # Normalization: sum of weighted inputs = 1
+  add.constraint(lpmodel, xt = c(x0, rep(0, s), 0), type = "=", rhs = 1)
+  
+  # Solve LP
+  status <- solve(lpmodel)
+  if (status == 0) {
+    vars <- get.variables(lpmodel)
+    v <- vars[1:m]
+    u <- vars[(m + 1):(m + s)]
+    mu <- vars[total_vars]
+    eff <- sum(u * y0)  # Objective value = efficiency
+
+    eff_scores[dmu_index] <- eff
+    v_weights[dmu_index, ] <- v
+    u_weights[dmu_index, ] <- u
+    mu_vals[dmu_index] <- mu
+  } else {
+    eff_scores[dmu_index] <- NA
+    warning(paste("Infeasible model for DMU", dmu_index))
+  }
+}
+```
+
+
+
+```{r}
+results <- data.frame(
+  DMU = 1:n,
+  Efficiency = round(eff_scores, 4),
+  mu = round(mu_vals, 4)
+)
+
+results <- cbind(
+  results,
+  setNames(as.data.frame(round(v_weights, 4)), paste0("v", 1:m)),
+  setNames(as.data.frame(round(u_weights, 4)), paste0("u", 1:s))
+)
+
+print(results)
+```
+
+
+
+
+
+
+```{r}
+cross_eff_matrix <- matrix(0, n, n)
+
+for (j in 1:n) {
+  # ✅ Must reassign v_j and u_j for each j!
+  v_j <- v_weights[j, ]
+  u_j <- u_weights[j, ]
+
+  # Normalize v_j so that v_j * x_j = 1
+  denom_jj <- sum(v_j * inputs[j, ])
+  if (!is.na(denom_jj) && denom_jj != 0) {
+    v_j <- v_j / denom_jj
+  } else {
+    next
+  }
+
+  # Cross-evaluate every DMU k with DMU j's weights
+  for (k in 1:n) {
+    num <- sum(u_j * outputs[k, ])
+    den <- sum(v_j * inputs[k, ])
+    cross_eff_matrix[j, k] <- ifelse(den != 0, num / den, NA)
+  }
+}
+```
+
+
+```{r}
+cross_eff_scores <- colMeans(cross_eff_matrix, na.rm = TRUE)
+results$Cross_Efficiency <- round(cross_eff_scores, 4)
+```
+
+
+```{r}
+cross_eff_df <- as.data.frame(round(cross_eff_matrix, 4))
+colnames(cross_eff_df) <- paste0("DMU", 1:n)
+rownames(cross_eff_df) <- paste0("Evaluated_by_DMU", 1:n)
+
+cross_eff_df[n + 1, ] <- round(cross_eff_scores, 4)
+rownames(cross_eff_df)[n + 1] <- "Mean_CE_k"
+
+print(cross_eff_df)
+```
+
+
+```{r}
+results$Rank <- rank(-results$Cross_Efficiency, ties.method = "max")
+results$Rank
+```
+
+
+```{r}
+status <- solve(lpmodel)
+if (status == 0) {
+  cat("Solver status: Success\n")
+} else if (status == 2) {
+  cat("Solver status: Infeasible model ❌\n")
+}
+```
+
+```{r}
+status_vector <- numeric(n)
+
+status <- solve(lpmodel)
+status_vector[dmu_index] <- status
+
+table(status_vector)  # To check if any DMUs fail silently
+```
+
+
+```{r}
+summary(inputs)
+summary(outputs)
+```
+
+
+
+
+```{r}
+print(lpmodel)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+```
+
+
+```{r}
+# Create data frame
+ahp_weights <- data.frame(
+  Criteria = c("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"),
+  Weight = c(0.093409, 0.186926, 0.04083, 0.255195, 0.088162, 0.104299, 0.159672, 0.071509)
+)
+
+# Add ranking (1 = highest weight)
+ahp_weights <- ahp_weights %>%
+  arrange(desc(Weight)) %>%
+  mutate(Rank = paste0("Rank ", row_number())) %>%
+  arrange(Criteria)  # Sort back by Criteria for original bar order
+
+# Plot bar chart
+ggplot(ahp_weights, aes(x = Criteria, y = Weight, fill = Criteria)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(label = Rank), vjust = -0.5, size = 4.5) +
+  scale_y_continuous(
+    limits = c(0, 0.3),  # Slightly above max value (0.255195)
+    breaks = seq(0, 0.3, by = 0.05),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(title = "AHP Criteria Weight", x = "Criteria", y = "Weight (%)") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(ggpattern)
+```
+
+```{r}
+# DEA data
+dea_ce <- data.frame(
+  Year = rep(2019:2024, each = 5),
+  DMU = rep(c("DMU1", "DMU2", "DMU3", "DMU4", "DMU5"), times = 6),
+  Efficiency = c(
+    0.930213, 1.010391, 0.735643, 0.912352, 0.912777,
+    0.662593498, 0.999711435, 0.197224534, 0.672620749, 0.575236539,
+    0.885597267, 0.972699317, 0.639221638, 1.000062704, 0.818224926,
+    0.826204895, 1.000047819, 0.778310511, 0.927249605, 0.712153838,
+    0.768158, 1.000165099, 0.585324167, 0.937485355, 0.703772507,
+    0.737250837, 0.999901679, 0.632961035, 0.875128715, 0.795210652
+  )
+)
+
+# Rank each DMU within its year
+dea_ce <- dea_ce %>%
+  group_by(Year) %>%
+  arrange(desc(Efficiency), .by_group = TRUE) %>%
+  mutate(Rank = row_number())
+```
+
+
+```{r}
+# Grayscale color palette (visually distinct in B/W)
+gray_palette <- c("gray10", "gray30", "gray50", "gray70", "gray90")
+names(gray_palette) <- c("DMU1", "DMU2", "DMU3", "DMU4", "DMU5")
+
+# Plot
+ggplot(dea_ce, aes(x = factor(Year), y = Efficiency, fill = DMU)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = Rank),
+            position = position_dodge(width = 0.8),
+            vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = gray_palette) +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1.2, 0.2)) +
+  labs(title = "Cross Efficiency DEA Results (2019–2024)",
+       x = "Year", y = "Mean Cross Efficiency Score", fill = "DMU") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top"
+  )
+
+
+```
+
+
+```{r}
+# Create stock growth data
+stock_growth <- data.frame(
+  Year = 2019:2024,
+  DMU1 = c(2.076779026, 1.947826087, 1.985321101, 2.078212291, 1.941278066, 2.179816514),
+  DMU2 = c(1.850877193, 2.042382589, 2.023076923, 2.104189044, 1.9192607,   2.084656085),
+  DMU3 = c(1.877224199, 1.872210953, 2.26744186,  2.064220183, 2.00862069,  2.386324786),
+  DMU4 = c(1.807692308, 2.032581454, 2.009708738, 2.038461538, 1.993055556, 2.048951049),
+  DMU5 = c(1.935828877, 1.966857143, 1.98108747,  2.048192771, 2.02183908,  2.140607424)
+)
+
+# Convert to long format for ggplot
+stock_long <- pivot_longer(stock_growth, cols = starts_with("DMU"), 
+                           names_to = "DMU", values_to = "StockGrowth")
+
+# Add rank within each year
+stock_long <- stock_long %>%
+  group_by(Year) %>%
+  arrange(desc(StockGrowth), .by_group = TRUE) %>%
+  mutate(Rank = row_number())
+```
+
+
+```{r}
+# Grayscale palette
+gray_palette <- c("gray10", "gray30", "gray50", "gray70", "gray90")
+names(gray_palette) <- c("DMU1", "DMU2", "DMU3", "DMU4", "DMU5")
+
+# Final plot without y-axis limits
+ggplot(stock_long, aes(x = factor(Year), y = StockGrowth, fill = DMU)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = Rank),
+            position = position_dodge(width = 0.8),
+            vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = gray_palette) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Stock Growth of Banks (2019–2024)",
+       x = "Year", y = "Stock Growth (Ratio)", fill = "DMU") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top"
+  )
+```
+
+
+
+
+
+
+
